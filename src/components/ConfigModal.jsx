@@ -42,25 +42,31 @@ export default function ConfigModal({ onSave, existingConfig, onClose }) {
         }
         setTesting(true); setError('');
         try {
-            const res = await fetch('/api/chat', {
+            const endpoint = form.endpoint.replace(/\/$/, '');
+            const url = `${endpoint}/openai/deployments/${form.deployment}/chat/completions?api-version=2024-12-01-preview`;
+            const res = await fetch(url, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': form.apiKey,
+                },
                 body: JSON.stringify({
-                    messages: [{ role: 'user', content: 'Hello, just testing the connection.' }],
-                    apiKey: form.apiKey,
-                    endpoint: form.endpoint,
-                    deployment: form.deployment,
-                    systemPrompt: 'You are a test assistant. Reply with just "Connection successful!"',
+                    messages: [
+                        { role: 'system', content: 'You are a test assistant. Reply with just "Connection successful!"' },
+                        { role: 'user', content: 'Hello' },
+                    ],
+                    max_tokens: 20,
+                    stream: false,
                 }),
             });
             if (res.ok) {
                 setError('✅ Connection successful! You can now save and start chatting.');
             } else {
                 const data = await res.json().catch(() => ({}));
-                setError(`❌ ${data.error || 'Connection failed.'}`);
+                setError(`❌ ${data?.error?.message || `HTTP ${res.status} – connection failed.`}`);
             }
-        } catch {
-            setError('❌ Could not reach the server. Make sure the backend is running.');
+        } catch (e) {
+            setError(`❌ Network error: ${e.message}`);
         } finally {
             setTesting(false);
         }

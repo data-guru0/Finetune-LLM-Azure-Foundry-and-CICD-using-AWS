@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import ConfigModal from './components/ConfigModal';
 import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
@@ -8,6 +8,7 @@ import './index.css';
 
 const STORAGE_KEY = 'support_bot_config';
 const SESSIONS_KEY = 'support_bot_sessions';
+const API_VERSION = '2024-12-01-preview';
 
 function App() {
   const [config, setConfig] = useState(null);
@@ -16,7 +17,6 @@ function App() {
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [isStreaming, setIsStreaming] = useState(false);
 
-  // Load config and sessions from localStorage
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
@@ -38,7 +38,6 @@ function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
     setConfig(cfg);
     setShowConfigModal(false);
-    // Start a new session if none exist
     if (sessions.length === 0) createNewSession(cfg);
   };
 
@@ -60,7 +59,6 @@ function App() {
     setSessions(prev => {
       const updated = prev.map(s => {
         if (s.id !== id) return s;
-        // Auto-title from first user message
         let title = s.title;
         if (title === 'New conversation' && messages.length > 0) {
           const firstUser = messages.find(m => m.role === 'user');
@@ -83,25 +81,40 @@ function App() {
     setIsStreaming(true);
     const botMsgId = `bot-${Date.now()}`;
     const botMsg = { role: 'assistant', content: '', timestamp: new Date().toISOString(), id: botMsgId, streaming: true };
-    const msgsWithBot = [...newMessages, botMsg];
-    updateSession(activeSession.id, msgsWithBot);
+    updateSession(activeSession.id, [...newMessages, botMsg]);
+
+    // Call Azure OpenAI REST API directly from the browser
+    const endpoint = config.endpoint.replace(/\/$/, '');
+    const url = `${endpoint}/openai/deployments/${config.deployment}/chat/completions?api-version=${API_VERSION}`;
+
+    const allMessages = [
+      {
+        role: 'system',
+        content: config.systemPrompt || 'You are a helpful and professional customer support assistant. Be concise, friendly, and empathetic.',
+      },
+      ...newMessages.map(({ role, content }) => ({ role, content })),
+    ];
 
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': config.apiKey,
+        },
         body: JSON.stringify({
-          messages: newMessages.map(({ role, content }) => ({ role, content })),
-          apiKey: config.apiKey,
-          endpoint: config.endpoint,
-          deployment: config.deployment,
-          systemPrompt: config.systemPrompt,
+          messages: allMessages,
+          stream: true,
+          max_tokens: 4096,
+          temperature: 0.7,
+          top_p: 1.0,
         }),
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: 'Server error' }));
-        throw new Error(err.error || 'Server error');
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData?.error?.message || `HTTP ${res.status} – ${res.statusText}`;
+        throw new Error(msg);
       }
 
       const reader = res.body.getReader();
@@ -117,13 +130,13 @@ function App() {
         buffer = lines.pop();
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
+          const data = line.slice(6).trim();
           if (data === '[DONE]') break;
           try {
             const parsed = JSON.parse(data);
-            if (parsed.error) throw new Error(parsed.error);
-            if (parsed.content) {
-              fullContent += parsed.content;
+            const delta = parsed?.choices?.[0]?.delta?.content;
+            if (delta) {
+              fullContent += delta;
               setSessions(prev => {
                 const updated = prev.map(s => {
                   if (s.id !== activeSession.id) return s;
@@ -136,9 +149,7 @@ function App() {
                 return updated;
               });
             }
-          } catch (e) {
-            if (e.message !== 'Unexpected end of JSON input') throw e;
-          }
+          } catch { /* partial chunk, skip */ }
         }
       }
 
@@ -146,24 +157,24 @@ function App() {
       setSessions(prev => {
         const updated = prev.map(s => {
           if (s.id !== activeSession.id) return s;
-          const updatedMsgs = s.messages.map(m =>
-            m.id === botMsgId ? { ...m, streaming: false } : m
-          );
-          return { ...s, messages: updatedMsgs };
+          return { ...s, messages: s.messages.map(m => m.id === botMsgId ? { ...m, streaming: false } : m) };
         });
         localStorage.setItem(SESSIONS_KEY, JSON.stringify(updated));
         return updated;
       });
+
     } catch (err) {
       setSessions(prev => {
         const updated = prev.map(s => {
           if (s.id !== activeSession.id) return s;
-          const updatedMsgs = s.messages.map(m =>
-            m.id === botMsgId
-              ? { ...m, content: `⚠️ Error: ${err.message}`, streaming: false, error: true }
-              : m
-          );
-          return { ...s, messages: updatedMsgs };
+          return {
+            ...s,
+            messages: s.messages.map(m =>
+              m.id === botMsgId
+                ? { ...m, content: `⚠️ Error: ${err.message}`, streaming: false, error: true }
+                : m
+            ),
+          };
         });
         localStorage.setItem(SESSIONS_KEY, JSON.stringify(updated));
         return updated;
